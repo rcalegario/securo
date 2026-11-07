@@ -1,0 +1,70 @@
+name: Sync upstream release
+
+# Mirrors the latest upstream release into `main` (fast-forward only) and opens
+# a PR `main` -> `custom` so conflicts are resolved there.
+# `main` must stay an untouched mirror of upstream; do all work on `custom`.
+#
+# Requires the SYNC_TOKEN secret (PAT with `repo` + `workflow` scopes): the
+# default GITHUB_TOKEN cannot push commits that modify .github/workflows/.
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: securo-finance/securo
+  GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Find latest upstream release
+        id: release
+        run: |
+          tag=$(gh release view -R "$UPSTREAM" --json tagName -q .tagName)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Fast-forward main to the release tag
+        id: sync
+        run: |
+          tag='${{ steps.release.outputs.tag }}'
+          git fetch "https://github.com/$UPSTREAM.git" "refs/tags/$tag:refs/tags/$tag"
+          if git merge-base --is-ancestor "$tag" main; then
+            echo "main already contains $tag"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git merge --ff-only "$tag"
+          git push origin main
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update PR main -> custom
+        run: |
+          tag='${{ steps.release.outputs.tag }}'
+          if [ "$(git rev-list --count origin/custom..main)" = "0" ]; then
+            echo "custom already contains main; no PR needed"
+            exit 0
+          fi
+          title="chore: sync upstream $tag"
+          body="Upstream release [$tag](https://github.com/$UPSTREAM/releases/tag/$tag). Resolve conflicts here."
+          existing=$(gh pr list --base custom --head main --state open --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --title "$title" --body "$body"
+          else
+            gh pr create --base custom --head main --title "$title" --body "$body"
+          fi
